@@ -1,7 +1,8 @@
 """SQLite 存储层。
 
-同步驱动 sqlite3，每请求一个连接。金额以整数分存储，
-刷卡时刻以 'YYYY-MM-DD HH:MM:SS' 文本存储（可直接排序）。
+同步驱动 sqlite3，每请求一个连接。金额以整数分存储（与核验计算同一
+口径，落库不再做元->分浮点换算，边界值不会溢出或失真），刷卡时刻以
+'YYYY-MM-DD HH:MM:SS' 文本存储（可直接排序）。
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
-from .core import Config, Fare, Station, Swipe
+from .core import Config, Fare, Station, Swipe, parse_amount_cents
 
 DB_PATH = os.environ.get("DB_PATH", "/data/bus.db")
 
@@ -26,11 +27,35 @@ def _ensure_parent(path: str) -> None:
 
 
 def _yuan(cents: int) -> float:
-    return round(cents / 100.0, 2)
+    return round(int(cents) / 100.0, 2)
 
 
-def _cents(yuan: float) -> int:
-    return int(round(float(yuan) * 100))
+def _yuan_text(cents: int) -> str:
+    """整数分 -> 两位小数文本（写入 meta 的金额格式）。"""
+    cents = int(cents)
+    return f"{cents // 100}.{cents % 100:02d}"
+
+
+def _meta_amount(value: Optional[str], default_cents: int) -> int:
+    """读取 meta 中的金额（元文本）-> 整数分。
+
+    meta 只由本应用通过 update_config 写入，正常情况下必然合法；
+    若被外部篡改为非法值，则回退默认值（不抛异常、不写回该值，
+    原配置保持不变），保证读路径始终拿到可核验的整数分配置。
+    """
+    if value is None:
+        return default_cents
+    try:
+        return parse_amount_cents(value, "规则金额")
+    except ValueError:
+        return default_cents
+
+
+def _meta_int(value: Optional[str], default: int) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
 
 
 SCHEMA = """
@@ -233,17 +258,21 @@ def get_config(conn: sqlite3.Connection) -> Config:
         return v if v is not None else default
 
     return Config(
-        transfer_minutes=int(g("transfer_minutes", DEFAULT_CONFIG["transfer_minutes"])),
-        transfer_discount=float(g("transfer_discount", DEFAULT_CONFIG["transfer_discount"])),
-        daily_cap=float(g("daily_cap", DEFAULT_CONFIG["daily_cap"])),
-        day_split_hour=int(g("day_split_hour", DEFAULT_CONFIG["day_split_hour"])),
+        transfer_minutes=_meta_int(
+            g("transfer_minutes", DEFAULT_CONFIG["transfer_minutes"]), 90),
+        transfer_discount_cents=_meta_amount(
+            g("transfer_discount", DEFAULT_CONFIG["transfer_discount"]), 100),
+        daily_cap_cents=_meta_amount(
+            g("daily_cap", DEFAULT_CONFIG["daily_cap"]), 1000),
+        day_split_hour=_meta_int(
+            g("day_split_hour", DEFAULT_CONFIG["day_split_hour"]), 4),
     )
 
 
 def update_config(conn: sqlite3.Connection, cfg: Config) -> None:
     set_meta(conn, "transfer_minutes", str(cfg.transfer_minutes))
-    set_meta(conn, "transfer_discount", f"{cfg.transfer_discount:.2f}")
-    set_meta(conn, "daily_cap", f"{cfg.daily_cap:.2f}")
+    set_meta(conn, "transfer_discount", _yuan_text(cfg.transfer_discount_cents))
+    set_meta(conn, "daily_cap", _yuan_text(cfg.daily_cap_cents))
     set_meta(conn, "day_split_hour", str(cfg.day_split_hour))
 
 
@@ -262,7 +291,7 @@ def replace_fares(conn: sqlite3.Connection, fares: list[Fare]) -> None:
     conn.execute("DELETE FROM fare")
     conn.executemany(
         "INSERT INTO fare(from_zone, to_zone, price_cents) VALUES (?, ?, ?)",
-        [(f.from_zone, f.to_zone, _cents(f.price)) for f in fares])
+        [(f.from_zone, f.to_zone, f.price_cents) for f in fares])
 
 
 def replace_records(conn: sqlite3.Connection, records: list[Swipe]) -> None:
@@ -286,9 +315,9 @@ def save_bills(conn: sqlite3.Connection, bills: list[dict]) -> None:
         [(b["card"], b["seq"], b["operating_day"], b["entry_time"],
           b["exit_time"], b["entry_station"], b["exit_station"],
           b["from_zone"], b["to_zone"],
-          _cents(b["base_fare"]), _cents(b["discount"]),
-          _cents(b["charged_fare"]), _cents(b["daily_cumulative"]),
-          _cents(b["daily_cap"]), b["discount_source"],
+          b["base_cents"], b["discount_cents"],
+          b["charged_cents"], b["cumulative_cents"],
+          b["cap_cents"], b["discount_source"],
           b["entry_line"], b["exit_line"]) for b in bills])
     set_meta(conn, "last_verified_at",
              datetime.now().strftime(TIME_FMT))
@@ -332,7 +361,7 @@ def load_domain(conn: sqlite3.Connection):
     stations = [Station(name=r["name"], zone=r["zone"])
                 for r in conn.execute("SELECT name, zone FROM station")]
     fares = [Fare(from_zone=r["from_zone"], to_zone=r["to_zone"],
-                  price=_yuan(r["price_cents"]))
+                  price_cents=r["price_cents"])
              for r in conn.execute(
                  "SELECT from_zone, to_zone, price_cents FROM fare")]
     records: list[Swipe] = []
@@ -357,6 +386,13 @@ def list_bills(conn: sqlite3.Connection) -> list[dict]:
             "entry_station": r["entry_station"],
             "exit_station": r["exit_station"],
             "from_zone": r["from_zone"], "to_zone": r["to_zone"],
+            # 整数分（核验计算与账单落库的统一口径）
+            "base_cents": r["base_cents"],
+            "discount_cents": r["discount_cents"],
+            "charged_cents": r["charge_cents"],
+            "cumulative_cents": r["cumulative_cents"],
+            "cap_cents": r["cap_cents"],
+            # 元（两位小数），仅用于对外展示
             "base_fare": _yuan(r["base_cents"]),
             "discount": _yuan(r["discount_cents"]),
             "charged_fare": _yuan(r["charge_cents"]),

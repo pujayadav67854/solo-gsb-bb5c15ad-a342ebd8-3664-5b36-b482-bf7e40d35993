@@ -13,8 +13,9 @@ from fastapi.staticfiles import StaticFiles
 
 from . import db
 from .core import (
-    Config,
+    build_config,
     compensation_preview,
+    config_snapshot,
     dispute_preview,
     duration_audit,
     external_merge_preview,
@@ -29,7 +30,6 @@ from .core import (
     repair_preview,
     station_peak_audit,
     trial_compare,
-    validate_config,
     verify,
 )
 from .schemas import (
@@ -108,12 +108,13 @@ def get_config():
 
 @app.put("/api/config")
 def put_config(body: ConfigIn):
-    cfg = Config(
-        transfer_minutes=body.transfer_minutes,
-        transfer_discount=body.transfer_discount,
-        daily_cap=body.daily_cap,
-        day_split_hour=body.day_split_hour,
-    )
+    # 金额按十进制解析为整数分（非负、最多两位小数、处于 SQLite 64 位
+    # 范围内）；非法时返回带字段名的 422，且不触碰任何已保存数据。
+    cfg, errors = build_config(
+        body.transfer_minutes, body.transfer_discount,
+        body.daily_cap, body.day_split_hour)
+    if errors:
+        return _parse_error_response(errors)
     with db.connect() as conn:
         db.update_config(conn, cfg)
         # 规则参数变化后，旧账单可能已不再成立：
@@ -280,26 +281,31 @@ def run_trial_compare(body: TrialConfigIn):
     - 两边均成功时返回按 (卡号, 卡内序号) 对齐的行程行、
       每张卡汇总与全批次汇总。
     """
-    draft_cfg = Config(
-        transfer_minutes=body.transfer_minutes,
-        transfer_discount=body.transfer_discount,
-        daily_cap=body.daily_cap,
-        day_split_hour=body.day_split_hour,
-    )
     with db.connect() as conn:
         current_cfg = db.get_config(conn)
         stations, fares, records = db.load_domain(conn)
-        # 草案参数先按核心规则校验（错误返回原有 CONFIG_BAD）；
-        # 合法时把整数型字段规整为 int，使运营日/分钟相关文案与正式配置口径一致。
-        draft_errors = validate_config(draft_cfg)
-        if not draft_errors:
-            draft_cfg = Config(
-                transfer_minutes=int(draft_cfg.transfer_minutes),
-                transfer_discount=draft_cfg.transfer_discount,
-                daily_cap=draft_cfg.daily_cap,
-                day_split_hour=int(draft_cfg.day_split_hour),
-            )
-        result = trial_compare(stations, fares, records, current_cfg, draft_cfg)
+
+    # 草案参数先按核心规则解析 / 校验：金额走与正式保存相同的十进制
+    # 整数分口径（非法返回带字段名的 CONFIG_BAD），间隔 / 分界时刻规整为
+    # int，使运营日 / 分钟相关文案与正式配置口径一致。
+    draft_cfg, draft_errors = build_config(
+        body.transfer_minutes, body.transfer_discount,
+        body.daily_cap, body.day_split_hour)
+    if draft_errors:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False,
+                     "current": {"config": config_snapshot(current_cfg),
+                                 "ok": True, "errors": []},
+                     "draft": {"config": {
+                                   "transfer_minutes": body.transfer_minutes,
+                                   "transfer_discount": body.transfer_discount,
+                                   "daily_cap": body.daily_cap,
+                                   "day_split_hour": body.day_split_hour},
+                               "ok": False,
+                               "errors": draft_errors}})
+
+    result = trial_compare(stations, fares, records, current_cfg, draft_cfg)
 
     if not result.ok:
         return JSONResponse(

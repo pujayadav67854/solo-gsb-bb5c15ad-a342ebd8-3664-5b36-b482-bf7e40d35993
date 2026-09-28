@@ -3,8 +3,11 @@
 纯标准库实现：文本解析、记录校验、进出站配对、
 换乘抵扣与运营日封顶计算。不依赖 FastAPI / SQLite，便于单独测试。
 
-金额在内部统一以「元」的浮点数表示并保留两位小数；
-存储层写入 SQLite 时转换为整数分，避免二进制浮点误差。
+金额在录入时即按十进制文本解析为**整数分**（非负、最多两位小数、
+换算成整数分后不超过 SQLite 有符号 64 位范围）；核验计价、路径审计、
+通票回测等全部计算与账单落库共用同一整数分口径，避免边界值经浮点
+转换后溢出或失真。对外展示的金额（元，两位小数）仅在输出边界由
+整数分换算得到。
 """
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 # 允许的文本分隔符：逗号、制表符、分号、空白(多空格)、全角逗号
@@ -80,6 +84,66 @@ def _round2(x: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# 十进制金额解析（元 -> 整数分）
+# ---------------------------------------------------------------------------
+
+# 金额允许的最大整数分：SQLite 整数列为有符号 64 位。
+# 票价 / 抵扣额 / 封顶额在解析阶段就拒绝换算后超出该范围的值，
+# 保证后续计算与账单落库不可能触发整数溢出。
+SQLITE_INT64_MAX = 2 ** 63 - 1
+# 金额的小数位上限：分，不接受厘及更细的小数（不做静默四舍五入）。
+_AMOUNT_CENT_SCALE = 2
+
+
+def parse_amount_cents(value, label: str = "金额") -> int:
+    """把十进制金额（元）解析为整数分。
+
+    接受字符串或十进制数值（int/float，不接受 bool）；统一按十进制
+    解析，规则：
+
+    - 必须是非负有限数（拒绝负数、NaN、Infinity）；
+    - 最多两位小数（精确到分；超过两位直接判非法，不四舍五入）；
+    - 换算为整数分后不超过 SQLite 有符号 64 位范围
+      （SQLITE_INT64_MAX 分）。
+
+    任一条件不满足抛 ValueError（文案携带字段名 label，由调用方
+    包装为带字段名 / 行号的定位错误）。
+    """
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(f"{label}必须是十进制数字：{value!r}")
+    text = str(value).strip()
+    if text == "":
+        raise ValueError(f"{label}必须是十进制数字：{value!r}")
+    try:
+        d = Decimal(text)
+    except InvalidOperation:
+        raise ValueError(f"{label}必须是十进制数字：{value!r}")
+    if not d.is_finite():
+        raise ValueError(f"{label}必须是有限数字：{value!r}")
+    if d < 0:
+        raise ValueError(f"{label}必须是不小于 0 的数字：{value!r}")
+    if d.as_tuple().exponent < -_AMOUNT_CENT_SCALE:
+        raise ValueError(f"{label}最多保留两位小数（精确到分）：{value!r}")
+    cents = (d * 100).to_integral_value()
+    if cents > SQLITE_INT64_MAX:
+        raise ValueError(
+            f"{label}超出允许范围（换算为分后超过 SQLite "
+            f"64 位整数上限 {SQLITE_INT64_MAX} 分，"
+            f"即约 {_yuan_text(SQLITE_INT64_MAX)} 元）：{value!r}")
+    return int(cents)
+
+
+def _yuan_of(cents: int) -> float:
+    """整数分 -> 元（浮点数，仅用于对外展示）。"""
+    return round(int(cents) / 100.0, 2)
+
+
+def _yuan_text(cents: int) -> str:
+    """整数分 -> 两位小数字符串（不经浮点，超大金额也不会失真）。"""
+    return f"{int(cents) // 100}.{int(cents) % 100:02d}"
+
+
+# ---------------------------------------------------------------------------
 # 数据结构
 # ---------------------------------------------------------------------------
 
@@ -94,8 +158,13 @@ class Station:
 class Fare:
     from_zone: int
     to_zone: int
-    price: float
+    price_cents: int          # 票价（整数分）
     line: int = 1
+
+    @property
+    def price(self) -> float:
+        """票价（元，仅用于对外展示）。"""
+        return _yuan_of(self.price_cents)
 
 
 @dataclass
@@ -113,10 +182,20 @@ class Swipe:
 
 @dataclass
 class Config:
-    transfer_minutes: int = 90          # 换乘有效间隔（分钟）
-    transfer_discount: float = 1.0      # 换乘抵扣额（元）
-    daily_cap: float = 10.0             # 每卡每运营日封顶额（元）
-    day_split_hour: int = 4             # 运营日分界时刻
+    transfer_minutes: int = 90              # 换乘有效间隔（分钟）
+    transfer_discount_cents: int = 100      # 换乘抵扣额（整数分，默认 1 元）
+    daily_cap_cents: int = 1000             # 每卡每运营日封顶额（整数分，默认 10 元）
+    day_split_hour: int = 4                 # 运营日分界时刻
+
+    @property
+    def transfer_discount(self) -> float:
+        """换乘抵扣额（元，仅用于对外展示）。"""
+        return _yuan_of(self.transfer_discount_cents)
+
+    @property
+    def daily_cap(self) -> float:
+        """每卡每运营日封顶额（元，仅用于对外展示）。"""
+        return _yuan_of(self.daily_cap_cents)
 
 
 @dataclass
@@ -172,6 +251,8 @@ def _parse_int(text: str, label: str) -> int:
 
 
 def _parse_amount(text: str, label: str = "金额") -> float:
+    """非负有限金额（元）-> 两位小数浮点。仅用于通票价格等不落库金额；
+    票价 / 规则配置金额一律走 parse_amount_cents 的整数分口径。"""
     try:
         v = float(str(text).strip())
     except (TypeError, ValueError):
@@ -230,7 +311,7 @@ def parse_fares_text(text: str) -> tuple[list[Fare], list[dict]]:
         try:
             fz = _parse_int(fz_text, "起始分区")
             tz = _parse_int(tz_text, "到达分区")
-            price = _parse_amount(price_text, "票价")
+            price = parse_amount_cents(price_text, "票价")
         except ValueError as ex:
             errors.append(_err("FARE_BAD_VALUE", str(ex), line=i))
             continue
@@ -239,7 +320,7 @@ def parse_fares_text(text: str) -> tuple[list[Fare], list[dict]]:
             errors.append(_err("FARE_DUPLICATE",
                                f"分区 {fz}->{tz} 的票价重复定义", line=i))
             continue
-        fares.append(Fare(from_zone=fz, to_zone=tz, price=price, line=i))
+        fares.append(Fare(from_zone=fz, to_zone=tz, price_cents=price, line=i))
         seen.add(key)
     return fares, errors
 
@@ -315,16 +396,86 @@ def _is_int_value(x) -> bool:
 
 
 def validate_config(cfg: Config) -> list[dict]:
+    """对已构造的 Config（整数分口径）做防御性校验。
+
+    正常路径下配置都经过 build_config() / db.get_config() 解析，
+    此函数只兜底直接构造 Config 的调用方（如核心层单测）。
+    """
     errors: list[dict] = []
-    if not _is_int_value(cfg.transfer_minutes) or cfg.transfer_minutes <= 0:
-        errors.append(_err("CONFIG_BAD", "换乘有效间隔必须为正整数（分钟）"))
-    if not _is_finite_number(cfg.transfer_discount) or cfg.transfer_discount < 0:
-        errors.append(_err("CONFIG_BAD", "换乘抵扣额不能为负且必须是有限数字"))
-    if not _is_finite_number(cfg.daily_cap) or cfg.daily_cap < 0:
-        errors.append(_err("CONFIG_BAD", "每日封顶额不能为负且必须是有限数字"))
-    if not _is_int_value(cfg.day_split_hour) or not (0 <= cfg.day_split_hour <= 23):
-        errors.append(_err("CONFIG_BAD", "运营日分界时刻必须是 0-23 之间的整数小时"))
+    if not isinstance(cfg.transfer_minutes, int) or cfg.transfer_minutes <= 0:
+        errors.append(_err("CONFIG_BAD",
+                           "换乘有效间隔必须为正整数（分钟）",
+                           param="transfer_minutes"))
+    if not (isinstance(cfg.transfer_discount_cents, int)
+            and 0 <= cfg.transfer_discount_cents <= SQLITE_INT64_MAX):
+        errors.append(_err(
+            "CONFIG_BAD",
+            "换乘抵扣额必须是非负、最多两位小数且换算为分后不超过 "
+            f"SQLite 64 位整数上限的金额", param="transfer_discount"))
+    if not (isinstance(cfg.daily_cap_cents, int)
+            and 0 <= cfg.daily_cap_cents <= SQLITE_INT64_MAX):
+        errors.append(_err(
+            "CONFIG_BAD",
+            "每日封顶额必须是非负、最多两位小数且换算为分后不超过 "
+            f"SQLite 64 位整数上限的金额", param="daily_cap"))
+    if not isinstance(cfg.day_split_hour, int) \
+            or not (0 <= cfg.day_split_hour <= 23):
+        errors.append(_err("CONFIG_BAD",
+                           "运营日分界时刻必须是 0-23 之间的整数小时",
+                           param="day_split_hour"))
     return errors
+
+
+def build_config(transfer_minutes, transfer_discount, daily_cap,
+                 day_split_hour) -> tuple[Optional[Config], list[dict]]:
+    """解析 API 传入的规则参数（金额按十进制解析为整数分）。
+
+    - 换乘有效间隔：正整数（分钟）；
+    - 换乘抵扣额 / 每日封顶额：非负、最多两位小数、换算成分后处于
+      SQLite 有符号 64 位范围内（parse_amount_cents）；
+    - 运营日分界时刻：0-23 的整数小时。
+
+    全部合法时返回 (Config, [])；任一非法返回 (None, 定位错误列表)，
+    错误经 location.param 指明出错字段，调用方返回 422 且不写任何数据。
+    """
+    errors: list[dict] = []
+
+    if not _is_int_value(transfer_minutes) or int(transfer_minutes) <= 0:
+        errors.append(_err("CONFIG_BAD",
+                           "换乘有效间隔必须为正整数（分钟）",
+                           param="transfer_minutes"))
+        minutes = 0
+    else:
+        minutes = int(transfer_minutes)
+
+    try:
+        discount_cents = parse_amount_cents(transfer_discount, "换乘抵扣额")
+    except ValueError as ex:
+        errors.append(_err("CONFIG_BAD", str(ex),
+                           param="transfer_discount"))
+        discount_cents = 0
+
+    try:
+        cap_cents = parse_amount_cents(daily_cap, "每日封顶额")
+    except ValueError as ex:
+        errors.append(_err("CONFIG_BAD", str(ex), param="daily_cap"))
+        cap_cents = 0
+
+    if not _is_int_value(day_split_hour) \
+            or not (0 <= int(day_split_hour) <= 23):
+        errors.append(_err("CONFIG_BAD",
+                           "运营日分界时刻必须是 0-23 之间的整数小时",
+                           param="day_split_hour"))
+        split_hour = 0
+    else:
+        split_hour = int(day_split_hour)
+
+    if errors:
+        return None, errors
+    return Config(transfer_minutes=minutes,
+                  transfer_discount_cents=discount_cents,
+                  daily_cap_cents=cap_cents,
+                  day_split_hour=split_hour), []
 
 
 # ---------------------------------------------------------------------------
@@ -356,8 +507,8 @@ def verify(stations: list[Station],
     errors.extend(validate_config(cfg))
 
     zone_of = {s.name: s.zone for s in stations}
-    fare_of: dict[tuple[int, int], float] = {
-        (f.from_zone, f.to_zone): f.price for f in fares
+    fare_of: dict[tuple[int, int], int] = {
+        (f.from_zone, f.to_zone): f.price_cents for f in fares
     }
 
     # 1) 站点引用检查（未知站点）
@@ -462,47 +613,53 @@ def verify(stations: list[Station],
         # 原子失败：不生成任何账单（无部分账单）
         return VerifyResult(ok=False, bills=[], errors=errors, trips=trips)
 
-    # 5) 计价：按 (卡号, 进站时刻) 顺序处理。
+    # 5) 计价：按 (卡号, 进站时刻) 顺序处理。金额全程整数分，与账单
+    #    落库同一口径，避免边界值经浮点转换后溢出或失真。
     #    - 换乘抵扣看「同卡前次出站 -> 本次进站」的真实间隔（跨运营日也算）；
     #    - 封顶按行程进站时刻所属运营日、分卡累计。
     per_card_prev_out: dict[str, Swipe] = {}
-    # 每卡每运营日累计实扣：card -> {day: amount}
-    cumulative: dict[str, dict[str, float]] = {}
+    # 每卡每运营日累计实扣（分）：card -> {day: cents}
+    cumulative: dict[str, dict[str, int]] = {}
 
     bills: list[dict] = []
     ordered_trips = sorted(trips, key=lambda x: (x[0], x[2].t))
 
+    cap_cents = cfg.daily_cap_cents
+    discount_cfg_cents = cfg.transfer_discount_cents
+    cap_yuan_text = _yuan_text(cap_cents)
+
     for card, _seq, sw_in, sw_out in ordered_trips:
         z1 = zone_of[sw_in.station]
         z2 = zone_of[sw_out.station]
-        base = _round2(fare_of[(z1, z2)])
+        base = fare_of[(z1, z2)]
         day = operating_day(sw_in.t, cfg.day_split_hour)
 
-        discount = 0.0
+        discount = 0
         source = "无"
         prev_out = per_card_prev_out.get(card)
         if prev_out is not None:
             gap_min = (sw_in.t - prev_out.t).total_seconds() / 60.0
             if 0 <= gap_min <= cfg.transfer_minutes:
-                discount = _round2(min(cfg.transfer_discount, base))
+                discount = min(discount_cfg_cents, base)
                 source = (f"换乘优惠（距上次出站 {int(round(gap_min))} 分钟，"
-                          f"≤{cfg.transfer_minutes} 分钟，抵扣 {discount:.2f} 元）")
+                          f"≤{cfg.transfer_minutes} 分钟，抵扣 "
+                          f"{_yuan_text(discount)} 元）")
 
-        after_discount = _round2(base - discount)
+        after_discount = base - discount
 
         card_days = cumulative.setdefault(card, {})
-        already = _round2(card_days.get(day, 0.0))
-        cap_room = _round2(cfg.daily_cap - already)
-        charge = _round2(max(0.0, min(after_discount, cap_room)))
+        already = card_days.get(day, 0)
+        cap_room = cap_cents - already
+        charge = max(0, min(after_discount, cap_room))
         if cap_room <= 0:
             source = (f"{source}；当日已封顶" if discount > 0
-                      else f"当日封顶（已累计 {already:.2f} 元，达到 "
-                           f"{cfg.daily_cap:.2f} 元）")
+                      else f"当日封顶（已累计 {_yuan_text(already)} 元，达到 "
+                           f"{cap_yuan_text} 元）")
         elif charge < after_discount:
             source = (f"{source}；封顶保护" if discount > 0
-                      else f"封顶保护（当日封顶 {cfg.daily_cap:.2f} 元）")
+                      else f"封顶保护（当日封顶 {cap_yuan_text} 元）")
 
-        card_days[day] = _round2(already + charge)
+        card_days[day] = already + charge
         per_card_prev_out[card] = sw_out
 
         bills.append({
@@ -515,12 +672,19 @@ def verify(stations: list[Station],
             "exit_station": sw_out.station,
             "from_zone": z1,
             "to_zone": z2,
-            "base_fare": base,
-            "discount": discount,
+            # 整数分（核验计算与账单落库的统一口径）
+            "base_cents": base,
+            "discount_cents": discount,
+            "charged_cents": charge,
+            "cumulative_cents": card_days[day],
+            "cap_cents": cap_cents,
+            # 元（两位小数），仅用于对外展示
+            "base_fare": _yuan_of(base),
+            "discount": _yuan_of(discount),
             "discount_source": source,
-            "charged_fare": charge,
-            "daily_cumulative": card_days[day],
-            "daily_cap": _round2(cfg.daily_cap),
+            "charged_fare": _yuan_of(charge),
+            "daily_cumulative": _yuan_of(card_days[day]),
+            "daily_cap": _yuan_of(cap_cents),
             "entry_line": sw_in.line,
             "exit_line": sw_out.line,
         })
@@ -787,13 +951,18 @@ def _snap_int(x) -> int | float:
     return int(x) if _is_finite_number(x) and float(x).is_integer() else x
 
 
-def _config_snapshot(cfg: Config) -> dict:
+def config_snapshot(cfg: Config) -> dict:
+    """对外展示的配置快照（金额为元，两位小数；整数字段为 int）。"""
     return {
         "transfer_minutes": _snap_int(cfg.transfer_minutes),
-        "transfer_discount": _round2(cfg.transfer_discount),
-        "daily_cap": _round2(cfg.daily_cap),
+        "transfer_discount": _yuan_of(cfg.transfer_discount_cents),
+        "daily_cap": _yuan_of(cfg.daily_cap_cents),
         "day_split_hour": _snap_int(cfg.day_split_hour),
     }
+
+
+# 兼容旧的内部命名（trial_compare 内部沿用）。
+_config_snapshot = config_snapshot
 
 
 def _index_bills(bills: list[dict]) -> dict[tuple[str, int], dict]:
@@ -859,43 +1028,47 @@ def trial_compare(stations: list[Station],
             "day_changed": cur_day != draft_day,
             "current_discount": cur_disc,
             "draft_discount": draft_disc,
-            "discount_diff": _round2((draft_disc or 0) - (cur_disc or 0)),
+            "discount_diff": _yuan_of(
+                (db["discount_cents"] if db else 0)
+                - (cb["discount_cents"] if cb else 0)),
             "current_charge": cur_charge,
             "draft_charge": draft_charge,
-            "charge_diff": _round2((draft_charge or 0) - (cur_charge or 0)),
+            "charge_diff": _yuan_of(
+                (db["charged_cents"] if db else 0)
+                - (cb["charged_cents"] if cb else 0)),
             "draft_discount_source": db["discount_source"] if db else None,
             "current_discount_source": cb["discount_source"] if cb else None,
         })
 
     card_summaries: list[dict] = []
     for card in sorted({k[0] for k in keys}):
-        cb_sum = sum(b["charged_fare"] for b in current.bills if b["card"] == card)
-        db_sum = sum(b["charged_fare"] for b in draft.bills if b["card"] == card)
-        cd_sum = sum(b["discount"] for b in current.bills if b["card"] == card)
-        dd_sum = sum(b["discount"] for b in draft.bills if b["card"] == card)
+        cb_sum = sum(b["charged_cents"] for b in current.bills if b["card"] == card)
+        db_sum = sum(b["charged_cents"] for b in draft.bills if b["card"] == card)
+        cd_sum = sum(b["discount_cents"] for b in current.bills if b["card"] == card)
+        dd_sum = sum(b["discount_cents"] for b in draft.bills if b["card"] == card)
         card_summaries.append({
             "card": card,
             "trip_count": sum(1 for k in keys if k[0] == card),
-            "current_charge_total": _round2(cb_sum),
-            "draft_charge_total": _round2(db_sum),
-            "charge_diff": _round2(db_sum - cb_sum),
-            "current_discount_total": _round2(cd_sum),
-            "draft_discount_total": _round2(dd_sum),
-            "discount_diff": _round2(dd_sum - cd_sum),
+            "current_charge_total": _yuan_of(cb_sum),
+            "draft_charge_total": _yuan_of(db_sum),
+            "charge_diff": _yuan_of(db_sum - cb_sum),
+            "current_discount_total": _yuan_of(cd_sum),
+            "draft_discount_total": _yuan_of(dd_sum),
+            "discount_diff": _yuan_of(dd_sum - cd_sum),
         })
 
-    cur_total = sum(b["charged_fare"] for b in current.bills)
-    draft_total = sum(b["charged_fare"] for b in draft.bills)
-    cur_disc_total = sum(b["discount"] for b in current.bills)
-    draft_disc_total = sum(b["discount"] for b in draft.bills)
+    cur_total = sum(b["charged_cents"] for b in current.bills)
+    draft_total = sum(b["charged_cents"] for b in draft.bills)
+    cur_disc_total = sum(b["discount_cents"] for b in current.bills)
+    draft_disc_total = sum(b["discount_cents"] for b in draft.bills)
     batch_summary = {
         "trip_count": len(keys),
-        "current_charge_total": _round2(cur_total),
-        "draft_charge_total": _round2(draft_total),
-        "charge_diff": _round2(draft_total - cur_total),
-        "current_discount_total": _round2(cur_disc_total),
-        "draft_discount_total": _round2(draft_disc_total),
-        "discount_diff": _round2(draft_disc_total - cur_disc_total),
+        "current_charge_total": _yuan_of(cur_total),
+        "draft_charge_total": _yuan_of(draft_total),
+        "charge_diff": _yuan_of(draft_total - cur_total),
+        "current_discount_total": _yuan_of(cur_disc_total),
+        "draft_discount_total": _yuan_of(draft_disc_total),
+        "discount_diff": _yuan_of(draft_disc_total - cur_disc_total),
     }
 
     return TrialResult(
@@ -937,12 +1110,13 @@ class FarePathAudit:
 
 
 def _cents_of(yuan: float) -> int:
-    """元 -> 整数分。路径成本全程以整数分累加，避免浮点误差影响等值比较。"""
+    """元（数值）-> 整数分。
+
+    仅用于金额已在整数分口径之外产生的场景（通票价格、补偿预算等
+    不落库的辅助计算）；票价 / 配置 / 账单金额一律直接使用整数分，
+    不再经浮点换算。
+    """
     return int(round(float(yuan) * 100))
-
-
-def _yuan_of(cents: int) -> float:
-    return round(cents / 100.0, 2)
 
 
 def _min_cost_paths(fare_cents: dict[tuple[int, int], int], source: int
@@ -1032,8 +1206,9 @@ def fare_path_audit(stations: list[Station],
 
     # 此时核验要么全部通过，要么仅剩 MISSING_FARE：站点必然全部已知
     zone_of = {s.name: s.zone for s in stations}
-    fare_cents = {(f.from_zone, f.to_zone): _cents_of(f.price) for f in fares}
-    fare_yuan = {(f.from_zone, f.to_zone): _round2(f.price) for f in fares}
+    fare_cents = {(f.from_zone, f.to_zone): f.price_cents for f in fares}
+    fare_yuan = {(f.from_zone, f.to_zone): _yuan_of(f.price_cents)
+                 for f in fares}
 
     # 实际行程分区对 -> 该对上的原始行程（卡号 / 序号 / 进出站记录）
     pair_trips: dict[tuple[int, int], list[tuple[str, int, Swipe, Swipe]]] = {}
@@ -1081,7 +1256,7 @@ def fare_path_audit(stations: list[Station],
                     "path": list(path),
                     "path_text": " → ".join(str(z) for z in path),
                     "legs": _path_legs(path, fare_yuan),
-                    "suggest_line": f"{z1}, {z2}, {price:.2f}",
+                    "suggest_line": f"{z1}, {z2}, {_yuan_text(cents)}",
                 })
             else:
                 # 不可达：保留原 MISSING_FARE 定位错误（逐受影响行程一条）
@@ -1096,7 +1271,7 @@ def fare_path_audit(stations: list[Station],
                 "from_zone": z1, "to_zone": z2,
                 "direct_price": fare_yuan[(z1, z2)],
                 "best_price": best,
-                "diff": _round2(fare_yuan[(z1, z2)] - best),
+                "diff": _yuan_of(direct - cents),
                 "path": list(path),
                 "path_text": " → ".join(str(z) for z in path),
                 "legs": _path_legs(path, fare_yuan),
@@ -2480,7 +2655,7 @@ def pass_backtest(bills: list[dict],
         if di is None:
             continue  # 范围外行程不参与回测
         slot = per_card.setdefault(b["card"], {}).setdefault(di, [0, 0])
-        slot[0] += _cents_of(b["charged_fare"])
+        slot[0] += b["charged_cents"]
         slot[1] += 1
         trip_count += 1
 
@@ -2598,7 +2773,10 @@ def _dispute_bill_view(bill: Optional[dict]) -> Optional[dict]:
 
 
 def _dispute_changed_fields(cur: dict, new: dict) -> list[str]:
-    """同一行程（行号对相同）两侧账单的差异字段列表（供页面高亮）。"""
+    """同一行程（行号对相同）两侧账单的差异字段列表（供页面高亮）。
+
+    金额字段按整数分比较，避免浮点表示导致的误判。
+    """
     fields: list[str] = []
     if cur["entry_time"] != new["entry_time"] \
             or cur["exit_time"] != new["exit_time"]:
@@ -2608,13 +2786,13 @@ def _dispute_changed_fields(cur: dict, new: dict) -> list[str]:
         fields.append("station")
     if cur["operating_day"] != new["operating_day"]:
         fields.append("operating_day")
-    if cur["base_fare"] != new["base_fare"]:
+    if cur["base_cents"] != new["base_cents"]:
         fields.append("base_fare")
-    if cur["discount"] != new["discount"]:
+    if cur["discount_cents"] != new["discount_cents"]:
         fields.append("discount")
-    if cur["charged_fare"] != new["charged_fare"]:
+    if cur["charged_cents"] != new["charged_cents"]:
         fields.append("charged_fare")
-    if cur["daily_cumulative"] != new["daily_cumulative"]:
+    if cur["cumulative_cents"] != new["cumulative_cents"]:
         fields.append("daily_cumulative")
     return fields
 
@@ -2789,18 +2967,18 @@ def dispute_preview(stations: list[Station],
         if cb is None:
             status = "added"
             added += 1
-            charge_diff = _round2(nb["charged_fare"])
-            discount_diff = _round2(nb["discount"])
+            charge_diff = _yuan_of(nb["charged_cents"])
+            discount_diff = _yuan_of(nb["discount_cents"])
         elif nb is None:
             status = "removed"
             removed += 1
-            charge_diff = _round2(-cb["charged_fare"])
-            discount_diff = _round2(-cb["discount"])
+            charge_diff = _yuan_of(-cb["charged_cents"])
+            discount_diff = _yuan_of(-cb["discount_cents"])
         else:
             fields = _dispute_changed_fields(cb, nb)
             day_changed = cb["operating_day"] != nb["operating_day"]
-            charge_diff = _round2(nb["charged_fare"] - cb["charged_fare"])
-            discount_diff = _round2(nb["discount"] - cb["discount"])
+            charge_diff = _yuan_of(nb["charged_cents"] - cb["charged_cents"])
+            discount_diff = _yuan_of(nb["discount_cents"] - cb["discount_cents"])
             if fields:
                 status = "changed"
                 changed += 1
@@ -2820,20 +2998,19 @@ def dispute_preview(stations: list[Station],
             "changed_fields": fields,
         })
 
-    cur_total = _round2(sum(b["charged_fare"] for b in current_bills))
-    new_total = _round2(sum(b["charged_fare"] for b in corrected_bills))
-    cur_disc = _round2(sum(b["discount"] for b in current_bills))
-    new_disc = _round2(sum(b["discount"] for b in corrected_bills))
-    delta = _round2(new_total - cur_total)
+    cur_total_cents = sum(b["charged_cents"] for b in current_bills)
+    new_total_cents = sum(b["charged_cents"] for b in corrected_bills)
+    cur_disc_cents = sum(b["discount_cents"] for b in current_bills)
+    new_disc_cents = sum(b["discount_cents"] for b in corrected_bills)
     summary = {
-        "current_total": cur_total,
-        "corrected_total": new_total,
-        "delta": delta,
-        "kind": "surcharge" if delta > 0
-                else "refund" if delta < 0 else "none",
-        "current_discount_total": cur_disc,
-        "corrected_discount_total": new_disc,
-        "discount_delta": _round2(new_disc - cur_disc),
+        "current_total": _yuan_of(cur_total_cents),
+        "corrected_total": _yuan_of(new_total_cents),
+        "delta": _yuan_of(new_total_cents - cur_total_cents),
+        "kind": "surcharge" if new_total_cents > cur_total_cents
+                else "refund" if new_total_cents < cur_total_cents else "none",
+        "current_discount_total": _yuan_of(cur_disc_cents),
+        "corrected_discount_total": _yuan_of(new_disc_cents),
+        "discount_delta": _yuan_of(new_disc_cents - cur_disc_cents),
         "trip_count_current": len(current_bills),
         "trip_count_corrected": len(corrected_bills),
         "added_count": added,
@@ -2893,12 +3070,17 @@ def _parse_comp_time(value, param: str) -> tuple[Optional[datetime], Optional[di
 
 
 def _comp_amount(value, label: str, param: str) -> tuple[int, Optional[dict]]:
-    """金额参数（元）-> 整数分；非法时返回 CONFIG_BAD 定位错误。"""
-    if not _is_finite_number(value) or float(value) < 0:
-        return 0, _err(
-            "CONFIG_BAD",
-            f"{label}必须是不小于 0 的有限数字（元）：{value!r}", param=param)
-    return _cents_of(float(value)), None
+    """金额参数（元）-> 整数分；非法时返回 CONFIG_BAD 定位错误。
+
+    与票价 / 规则金额同一十进制口径：非负、最多两位小数、换算成分后
+    不超过 SQLite 有符号 64 位范围（补偿预览只读取账单、不入库，
+    统一口径可避免边界值经浮点转换后溢出或失真）。
+    """
+    try:
+        cents = parse_amount_cents(value, label)
+    except ValueError as ex:
+        return 0, _err("CONFIG_BAD", str(ex), param=param)
+    return cents, None
 
 
 def compensation_preview(bills: list[dict],
@@ -2961,7 +3143,7 @@ def compensation_preview(bills: list[dict],
             continue
         slot = per_card.setdefault(b["card"], {"trips": 0, "charged": 0})
         slot["trips"] += 1
-        slot["charged"] += _cents_of(b["charged_fare"])
+        slot["charged"] += b["charged_cents"]
         trip_count += 1
 
     charged_total = sum(s["charged"] for s in per_card.values())

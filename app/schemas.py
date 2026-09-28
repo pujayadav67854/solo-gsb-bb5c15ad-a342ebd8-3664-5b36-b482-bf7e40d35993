@@ -11,10 +11,18 @@ class TextIn(BaseModel):
 
 
 class ConfigIn(BaseModel):
-    transfer_minutes: int = Field(gt=0, description="换乘有效间隔（分钟）")
-    transfer_discount: float = Field(ge=0, description="换乘抵扣额（元）")
-    daily_cap: float = Field(ge=0, description="每卡每运营日封顶额（元）")
-    day_split_hour: int = Field(ge=0, le=23, description="运营日分界时刻")
+    """正式保存的规则参数。
+
+    不在此处做数值约束：换乘间隔 / 分界时刻 / 金额（换乘抵扣额、每日
+    封顶额）的合法性统一走核心层 build_config（金额按十进制解析为整数分，
+    只接受非负、最多两位小数且换算成分后处于 SQLite 有符号 64 位范围内
+    的值），非法时返回带 location.param 的 CONFIG_BAD 定位错误（HTTP 422），
+    而不是请求体校验错误，且不写入任何配置。
+    """
+    transfer_minutes: float = Field(description="换乘有效间隔（分钟），正整数")
+    transfer_discount: float = Field(description="换乘抵扣额（元），非负、最多两位小数")
+    daily_cap: float = Field(description="每卡每运营日封顶额（元），非负、最多两位小数")
+    day_split_hour: float = Field(description="运营日分界时刻（0-23 的整数小时）")
 
 
 class TrialConfigIn(BaseModel):

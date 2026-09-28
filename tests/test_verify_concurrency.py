@@ -180,7 +180,7 @@ def test_cross_connection_interleaving(temp_db):
 
     # 连接 B（等效另一进程）：保存新票价，同一事务内递增版本并使账单失效
     with db.connect() as conn_b:
-        db.replace_fares(conn_b, [core.Fare(1, 1, 5.0)])
+        db.replace_fares(conn_b, [core.Fare(1, 1, price_cents=500)])
         db.bump_data_version(conn_b)
         db.clear_bills(conn_b)
 
