@@ -1,7 +1,7 @@
 """API 请求模型。"""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -11,21 +11,33 @@ class TextIn(BaseModel):
 
 
 class ConfigIn(BaseModel):
-    transfer_minutes: int = Field(gt=0, description="换乘有效间隔（分钟）")
-    transfer_discount: float = Field(ge=0, description="换乘抵扣额（元）")
-    daily_cap: float = Field(ge=0, description="每卡每运营日封顶额（元）")
-    day_split_hour: int = Field(ge=0, le=23, description="运营日分界时刻")
+    """规则参数。
+
+    金额字段接受 JSON 数字或十进制字符串（字符串用于精确传输接近
+    SQLite 64 位整数上限的超大金额，避免 JSON 浮点在传输中失真）；
+    不在此处做数值约束：非法值（含金额为负 / 两位以上小数 / 换算为分后
+    超出 SQLite 64 位整数范围）统一走核心层 build_config_from_input，
+    返回带字段名（location.param）的 CONFIG_BAD 定位错误（HTTP 422），
+    与试算草案等其他入口口径一致。
+    """
+    transfer_minutes: float = Field(description="换乘有效间隔（分钟），正整数")
+    transfer_discount: Union[float, str] = Field(
+        description="换乘抵扣额（元），非负、最多两位小数")
+    daily_cap: Union[float, str] = Field(
+        description="每卡每运营日封顶额（元），非负、最多两位小数")
+    day_split_hour: float = Field(description="运营日分界时刻（0-23 的整数小时）")
 
 
 class TrialConfigIn(BaseModel):
     """规则试算对比的草案参数。
 
-    不在此处做数值约束：非法草案应走 core.validate_config，
+    不在此处做数值约束：非法草案应走 core.build_config_from_input，
     返回与正式核验一致的 CONFIG_BAD 定位错误（HTTP 422）。
+    金额同样接受数字或十进制字符串（精确传输超大金额）。
     """
     transfer_minutes: float = Field(description="草案：换乘有效间隔（分钟）")
-    transfer_discount: float = Field(description="草案：换乘抵扣额（元）")
-    daily_cap: float = Field(description="草案：每卡每运营日封顶额（元）")
+    transfer_discount: Union[float, str] = Field(description="草案：换乘抵扣额（元）")
+    daily_cap: Union[float, str] = Field(description="草案：每卡每运营日封顶额（元）")
     day_split_hour: float = Field(description="草案：运营日分界时刻（0-23）")
 
 
@@ -130,5 +142,7 @@ class CompensationPreviewIn(BaseModel):
         description="中断开始时刻（闭区间起点），如 2026-09-18 08:00:00")
     end_time: str = Field(
         description="中断结束时刻（闭区间终点），如 2026-09-18 09:00:00")
-    budget: float = Field(description="补偿预算（元），不小于 0")
-    per_card_cap: float = Field(description="单卡补偿上限（元），不小于 0")
+    budget: Union[float, str] = Field(
+        description="补偿预算（元），非负、最多两位小数")
+    per_card_cap: Union[float, str] = Field(
+        description="单卡补偿上限（元），非负、最多两位小数")

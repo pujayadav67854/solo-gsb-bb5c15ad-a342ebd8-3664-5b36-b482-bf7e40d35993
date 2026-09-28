@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import db
 from .core import (
-    Config,
+    build_config_from_input,
     compensation_preview,
     dispute_preview,
     duration_audit,
@@ -29,8 +29,9 @@ from .core import (
     repair_preview,
     station_peak_audit,
     trial_compare,
-    validate_config,
+    trial_side_block,
     verify,
+    yuan_of_cents,
 )
 from .schemas import (
     CompensationPreviewIn,
@@ -68,6 +69,28 @@ def _parse_error_response(errors: list[dict], status: int = 422) -> JSONResponse
                         content={"ok": False, "errors": errors})
 
 
+# 内部账单（整数分键）-> API 账单（元键，保持页面与既有 API 不变）
+_BILL_CENTS_FIELDS = (
+    ("base_fare_cents", "base_fare"),
+    ("discount_cents", "discount"),
+    ("charged_fare_cents", "charged_fare"),
+    ("daily_cumulative_cents", "daily_cumulative"),
+    ("daily_cap_cents", "daily_cap"),
+)
+
+
+def serialize_bill(bill: dict) -> dict:
+    """把一条整数分账单换算为 API 输出（元）。"""
+    out = {k: v for k, v in bill.items()}
+    for cents_key, yuan_key in _BILL_CENTS_FIELDS:
+        out[yuan_key] = yuan_of_cents(out.pop(cents_key))
+    return out
+
+
+def serialize_bills(bills: list[dict]) -> list[dict]:
+    return [serialize_bill(b) for b in bills]
+
+
 def _silent_remove(path: str) -> None:
     """尽力删除文件（临时文件清理用），失败不抛异常。"""
     try:
@@ -100,20 +123,21 @@ def get_config():
         cfg = db.get_config(conn)
     return {
         "transfer_minutes": cfg.transfer_minutes,
-        "transfer_discount": cfg.transfer_discount,
-        "daily_cap": cfg.daily_cap,
+        "transfer_discount": yuan_of_cents(cfg.transfer_discount_cents),
+        "daily_cap": yuan_of_cents(cfg.daily_cap_cents),
         "day_split_hour": cfg.day_split_hour,
     }
 
 
 @app.put("/api/config")
 def put_config(body: ConfigIn):
-    cfg = Config(
-        transfer_minutes=body.transfer_minutes,
-        transfer_discount=body.transfer_discount,
-        daily_cap=body.daily_cap,
-        day_split_hour=body.day_split_hour,
-    )
+    # 金额按十进制解析为整数分；非法（负数 / 两位以上小数 / 超 64 位范围）
+    # 时返回带字段名的 422，不打开写事务：原配置、账单与数据版本不变。
+    cfg, errors = build_config_from_input(
+        body.transfer_minutes, body.transfer_discount,
+        body.daily_cap, body.day_split_hour)
+    if errors:
+        return _parse_error_response(errors)
     with db.connect() as conn:
         db.update_config(conn, cfg)
         # 规则参数变化后，旧账单可能已不再成立：
@@ -255,7 +279,7 @@ def run_verify():
         db.save_bills(conn, result.bills)
         return {"ok": True,
                 "bill_count": len(result.bills),
-                "bills": result.bills}
+                "bills": serialize_bills(result.bills)}
 
 
 @app.get("/api/bills")
@@ -263,7 +287,8 @@ def get_bills():
     with db.connect() as conn:
         bills = db.list_bills(conn)
         last = db.get_meta(conn, "last_verified_at")
-    return {"items": bills, "count": len(bills), "last_verified_at": last}
+    return {"items": serialize_bills(bills),
+            "count": len(bills), "last_verified_at": last}
 
 
 # ---------------------------------------------------------------------------
@@ -275,30 +300,44 @@ def run_trial_compare(body: TrialConfigIn):
     """用一组未保存的草案参数，对同一批已保存刷卡记录做双边试算。
 
     - 当前配置（已保存）与草案配置分别复用 core.verify 的配对 / 计价规则；
+    - 草案金额按十进制解析为整数分（非负、最多两位小数、64 位范围内），
+      非法时返回 422，draft 分块携带带字段名（location.param）的
+      CONFIG_BAD 错误，current 分块仍按已保存配置正常试算；
     - 任一方案存在错误（CONFIG_BAD 或数据错误）时返回 422，
       current / draft 各自携带该方案的原有定位错误，不修改任何数据；
     - 两边均成功时返回按 (卡号, 卡内序号) 对齐的行程行、
       每张卡汇总与全批次汇总。
     """
-    draft_cfg = Config(
-        transfer_minutes=body.transfer_minutes,
-        transfer_discount=body.transfer_discount,
-        daily_cap=body.daily_cap,
-        day_split_hour=body.day_split_hour,
-    )
     with db.connect() as conn:
         current_cfg = db.get_config(conn)
         stations, fares, records = db.load_domain(conn)
-        # 草案参数先按核心规则校验（错误返回原有 CONFIG_BAD）；
-        # 合法时把整数型字段规整为 int，使运营日/分钟相关文案与正式配置口径一致。
-        draft_errors = validate_config(draft_cfg)
-        if not draft_errors:
-            draft_cfg = Config(
-                transfer_minutes=int(draft_cfg.transfer_minutes),
-                transfer_discount=draft_cfg.transfer_discount,
-                daily_cap=draft_cfg.daily_cap,
-                day_split_hour=int(draft_cfg.day_split_hour),
-            )
+
+        # 草案参数按与正式配置相同的规则解析（金额 -> 整数分）；
+        # 非法草案只影响 draft 分块，不读取 / 修改任何已保存数据。
+        draft_cfg, draft_errors = build_config_from_input(
+            body.transfer_minutes, body.transfer_discount,
+            body.daily_cap, body.day_split_hour)
+        if draft_errors:
+            current = verify(stations, fares, records, current_cfg)
+            # 草案不合法时仍回显原始入参（与请求体一致），不做整数规整
+            draft_config = {
+                "transfer_minutes": body.transfer_minutes,
+                "transfer_discount": body.transfer_discount,
+                "daily_cap": body.daily_cap,
+                "day_split_hour": body.day_split_hour,
+            }
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "ok": False,
+                    "current": trial_side_block(current_cfg, current),
+                    "draft": {
+                        "config": draft_config,
+                        "ok": False,
+                        "errors": draft_errors,
+                    },
+                })
+
         result = trial_compare(stations, fares, records, current_cfg, draft_cfg)
 
     if not result.ok:

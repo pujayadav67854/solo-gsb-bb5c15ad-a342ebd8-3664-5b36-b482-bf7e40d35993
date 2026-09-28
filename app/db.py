@@ -1,6 +1,7 @@
 """SQLite 存储层。
 
-同步驱动 sqlite3，每请求一个连接。金额以整数分存储，
+同步驱动 sqlite3，每请求一个连接。金额全程以整数分存储与读取
+（core 层金额也是整数分，落库不再做任何元↔分浮点换算），
 刷卡时刻以 'YYYY-MM-DD HH:MM:SS' 文本存储（可直接排序）。
 """
 from __future__ import annotations
@@ -12,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
-from .core import Config, Fare, Station, Swipe
+from .core import Config, Fare, Station, Swipe, yuan_of_cents
 
 DB_PATH = os.environ.get("DB_PATH", "/data/bus.db")
 
@@ -26,11 +27,7 @@ def _ensure_parent(path: str) -> None:
 
 
 def _yuan(cents: int) -> float:
-    return round(cents / 100.0, 2)
-
-
-def _cents(yuan: float) -> int:
-    return int(round(float(yuan) * 100))
+    return yuan_of_cents(int(cents))
 
 
 SCHEMA = """
@@ -86,10 +83,11 @@ CREATE TABLE IF NOT EXISTS trip_bill (
 CREATE INDEX IF NOT EXISTS idx_bill_card ON trip_bill(card, seq);
 """
 
+# 规则参数持久化键：金额一律以整数分文本保存（与 core 的整数分口径一致）。
 DEFAULT_CONFIG = {
     "transfer_minutes": "90",
-    "transfer_discount": "1.00",
-    "daily_cap": "10.00",
+    "transfer_discount_cents": "100",
+    "daily_cap_cents": "1000",
     "day_split_hour": "4",
 }
 
@@ -227,24 +225,66 @@ def begin_write(conn: sqlite3.Connection) -> None:
     conn.execute("BEGIN IMMEDIATE")
 
 
+def _parse_config_cents(value: Optional[str], default: str) -> int:
+    """读取以整数分持久化的金额配置。
+
+    兼容旧版本以「元」文本（如 ``"1.00"``）保存的配置：含小数点时
+    按十进制元换算为分；旧键缺失时回退默认值（同样为分文本）。
+    """
+    if value is None:
+        value = default
+    text = str(value).strip()
+    if "." in text:
+        from decimal import Decimal, InvalidOperation
+        try:
+            return int(Decimal(text).scaleb(2))
+        except (InvalidOperation, ValueError):
+            return int(default)
+    try:
+        return int(text)
+    except ValueError:
+        return int(default)
+
+
 def get_config(conn: sqlite3.Connection) -> Config:
-    def g(key: str, default: str) -> str:
-        v = get_meta(conn, key)
-        return v if v is not None else default
+    def g(key: str) -> Optional[str]:
+        return get_meta(conn, key)
+
+    transfer_minutes = g("transfer_minutes")
+    day_split_hour = g("day_split_hour")
+
+    # 金额（整数分）。旧版本以「元」文本键 transfer_discount / daily_cap
+    # 保存；只要旧键仍存在（首次保存新配置时会被删除），就以旧键为准
+    # 按十进制换算为分，保证旧库升级后生效的仍是用户配置而非默认值。
+    def amount_cents(new_key: str, legacy_key: str, default_key: str) -> int:
+        legacy = g(legacy_key)
+        if legacy is not None:
+            return _parse_config_cents(legacy, DEFAULT_CONFIG[default_key])
+        return _parse_config_cents(g(new_key), DEFAULT_CONFIG[default_key])
 
     return Config(
-        transfer_minutes=int(g("transfer_minutes", DEFAULT_CONFIG["transfer_minutes"])),
-        transfer_discount=float(g("transfer_discount", DEFAULT_CONFIG["transfer_discount"])),
-        daily_cap=float(g("daily_cap", DEFAULT_CONFIG["daily_cap"])),
-        day_split_hour=int(g("day_split_hour", DEFAULT_CONFIG["day_split_hour"])),
+        transfer_minutes=int(
+            transfer_minutes if transfer_minutes is not None
+            else DEFAULT_CONFIG["transfer_minutes"]),
+        transfer_discount_cents=amount_cents(
+            "transfer_discount_cents", "transfer_discount",
+            "transfer_discount_cents"),
+        daily_cap_cents=amount_cents(
+            "daily_cap_cents", "daily_cap", "daily_cap_cents"),
+        day_split_hour=int(
+            day_split_hour if day_split_hour is not None
+            else DEFAULT_CONFIG["day_split_hour"]),
     )
 
 
 def update_config(conn: sqlite3.Connection, cfg: Config) -> None:
     set_meta(conn, "transfer_minutes", str(cfg.transfer_minutes))
-    set_meta(conn, "transfer_discount", f"{cfg.transfer_discount:.2f}")
-    set_meta(conn, "daily_cap", f"{cfg.daily_cap:.2f}")
+    set_meta(conn, "transfer_discount_cents",
+             str(cfg.transfer_discount_cents))
+    set_meta(conn, "daily_cap_cents", str(cfg.daily_cap_cents))
     set_meta(conn, "day_split_hour", str(cfg.day_split_hour))
+    # 清理旧版本的元文本金额键，避免两套键并存
+    conn.execute("DELETE FROM meta WHERE key IN ('transfer_discount', 'daily_cap')")
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +302,7 @@ def replace_fares(conn: sqlite3.Connection, fares: list[Fare]) -> None:
     conn.execute("DELETE FROM fare")
     conn.executemany(
         "INSERT INTO fare(from_zone, to_zone, price_cents) VALUES (?, ?, ?)",
-        [(f.from_zone, f.to_zone, _cents(f.price)) for f in fares])
+        [(f.from_zone, f.to_zone, f.price_cents) for f in fares])
 
 
 def replace_records(conn: sqlite3.Connection, records: list[Swipe]) -> None:
@@ -275,7 +315,11 @@ def replace_records(conn: sqlite3.Connection, records: list[Swipe]) -> None:
 
 
 def save_bills(conn: sqlite3.Connection, bills: list[dict]) -> None:
-    """一次核验产出：先清空旧账单，再写入新账单（同一事务）。"""
+    """一次核验产出：先清空旧账单，再写入新账单（同一事务）。
+
+    账单金额直接使用核验计算出的整数分，与核验同一口径，
+    不再经任何浮点换算，边界值不会溢出或失真。
+    """
     conn.execute("DELETE FROM trip_bill")
     conn.executemany(
         """INSERT INTO trip_bill(card, seq, operating_day, entry_time, exit_time,
@@ -286,9 +330,9 @@ def save_bills(conn: sqlite3.Connection, bills: list[dict]) -> None:
         [(b["card"], b["seq"], b["operating_day"], b["entry_time"],
           b["exit_time"], b["entry_station"], b["exit_station"],
           b["from_zone"], b["to_zone"],
-          _cents(b["base_fare"]), _cents(b["discount"]),
-          _cents(b["charged_fare"]), _cents(b["daily_cumulative"]),
-          _cents(b["daily_cap"]), b["discount_source"],
+          b["base_fare_cents"], b["discount_cents"],
+          b["charged_fare_cents"], b["daily_cumulative_cents"],
+          b["daily_cap_cents"], b["discount_source"],
           b["entry_line"], b["exit_line"]) for b in bills])
     set_meta(conn, "last_verified_at",
              datetime.now().strftime(TIME_FMT))
@@ -332,7 +376,7 @@ def load_domain(conn: sqlite3.Connection):
     stations = [Station(name=r["name"], zone=r["zone"])
                 for r in conn.execute("SELECT name, zone FROM station")]
     fares = [Fare(from_zone=r["from_zone"], to_zone=r["to_zone"],
-                  price=_yuan(r["price_cents"]))
+                  price_cents=r["price_cents"])
              for r in conn.execute(
                  "SELECT from_zone, to_zone, price_cents FROM fare")]
     records: list[Swipe] = []
@@ -346,6 +390,8 @@ def load_domain(conn: sqlite3.Connection):
 
 
 def list_bills(conn: sqlite3.Connection) -> list[dict]:
+    """读出最近一次核验账单。金额以整数分键返回（与 core 账单同一口径）；
+    HTTP 输出边界（main.serialize_bills）再换算为元。"""
     rows = conn.execute(
         """SELECT * FROM trip_bill ORDER BY card, seq, id""").fetchall()
     out = []
@@ -357,11 +403,11 @@ def list_bills(conn: sqlite3.Connection) -> list[dict]:
             "entry_station": r["entry_station"],
             "exit_station": r["exit_station"],
             "from_zone": r["from_zone"], "to_zone": r["to_zone"],
-            "base_fare": _yuan(r["base_cents"]),
-            "discount": _yuan(r["discount_cents"]),
-            "charged_fare": _yuan(r["charge_cents"]),
-            "daily_cumulative": _yuan(r["cumulative_cents"]),
-            "daily_cap": _yuan(r["cap_cents"]),
+            "base_fare_cents": r["base_cents"],
+            "discount_cents": r["discount_cents"],
+            "charged_fare_cents": r["charge_cents"],
+            "daily_cumulative_cents": r["cumulative_cents"],
+            "daily_cap_cents": r["cap_cents"],
             "discount_source": r["discount_source"],
             "entry_line": r["entry_line"], "exit_line": r["exit_line"],
         })

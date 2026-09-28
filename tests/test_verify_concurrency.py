@@ -56,9 +56,13 @@ def _payload(resp: JSONResponse) -> dict:
 
 
 def _state() -> tuple[list[dict], str | None, int]:
-    """当前 (账单, 核验时间, 数据版本)。"""
+    """当前 (账单, 核验时间, 数据版本)。
+
+    存储层账单以整数分键表示，这里经 API 同款序列化换算为元视图，
+    与既有断言口径保持一致。
+    """
     with db.connect() as conn:
-        return (db.list_bills(conn),
+        return (main.serialize_bills(db.list_bills(conn)),
                 db.get_meta(conn, "last_verified_at"),
                 db.get_data_version(conn))
 
@@ -180,7 +184,7 @@ def test_cross_connection_interleaving(temp_db):
 
     # 连接 B（等效另一进程）：保存新票价，同一事务内递增版本并使账单失效
     with db.connect() as conn_b:
-        db.replace_fares(conn_b, [core.Fare(1, 1, 5.0)])
+        db.replace_fares(conn_b, [core.Fare(1, 1, 500)])
         db.bump_data_version(conn_b)
         db.clear_bills(conn_b)
 
